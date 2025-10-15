@@ -441,15 +441,15 @@ Opal doesn't just provide text answers—it generates comprehensive, actionable 
 
 ```bash
 # Clone repository
-git clone https://github.com/your-org/privagent.git
-cd privagent
+git clone https://github.com/your-org/opal.git
+cd opal
 
 # Install frontend dependencies
-cd privagent-ui
+cd opal-ui
 pnpm install
 
 # Install backend dependencies
-cd ../privagent_backend
+cd ../opal_backend
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
@@ -462,12 +462,12 @@ python scripts/download_models.py
 
 ```bash
 # Terminal 1: Start backend
-cd privagent_backend
+cd opal_backend
 source venv/bin/activate
 python src/main.py
 
 # Terminal 2: Start frontend
-cd privagent-ui
+cd opal-ui
 pnpm run dev
 
 # Access application at http://localhost:5173
@@ -510,12 +510,12 @@ MIT License - See LICENSE file for details
 ## Contact
 
 For questions, partnerships, or enterprise inquiries:
-- **Email:** privagent@example.com
-- **Website:** https://privagent.ai
-- **GitHub:** https://github.com/your-org/privagent
-- **Twitter:** @PrivAgent
+- **Email:** opal@example.com
+- **Website:** https://opal.ai
+- **GitHub:** https://github.com/your-org/opal
+- **Twitter:** @Opal
 
 ---
 
-**PrivAgent: The agent that doesn't just think, but acts—securely, intelligently, and multi-modally.**
+**Opal: The agent that doesn't just think, but acts—securely, intelligently, and multi-modally.**
 
