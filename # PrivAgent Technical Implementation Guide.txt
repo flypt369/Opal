@@ -1,0 +1,1143 @@
+# Opal: Technical Implementation Guide
+
+## Overview
+
+This document provides detailed technical specifications for implementing PrivAgent, the privacy-preserving multi-modal business analyst agent. It covers architecture patterns, code examples, integration strategies, and deployment configurations.
+
+---
+
+## System Architecture
+
+### High-Level Components
+
+Opal follows a modular, microservices-inspired architecture with clear separation of concerns:
+
+1. **Presentation Layer** (React Frontend)
+2. **API Gateway** (FastAPI Backend)
+3. **Processing Pipeline** (Multi-Modal Ingestion)
+4. **Privacy Enforcement** (Redaction Engine)
+5. **Intelligence Layer** (LangGraph + LLMs)
+6. **Integration Layer** (MCP Client)
+7. **Output Generation** (Multi-Modal Synthesis)
+
+### Data Flow Architecture
+
+```
+User Input → Upload Handler → File Parser → Privacy Filter → 
+Knowledge Graph Builder → Reasoning Engine → Tool Orchestrator → 
+Output Generator → User Interface
+```
+
+Each stage is designed to be:
+- **Stateless:** No persistent state between requests (except user session)
+- **Idempotent:** Same input produces same output
+- **Isolated:** Failures in one stage don't cascade
+- **Observable:** Comprehensive logging and monitoring
+
+---
+
+## Component Implementation
+
+### 1. Multi-Modal Ingestion Module
+
+#### PDF Processing
+
+**Technology:** Donut (Document Understanding Transformer)
+
+**Implementation:**
+
+```python
+from transformers import DonutProcessor, VisionEncoderDecoderModel
+from PIL import Image
+import pdf2image
+
+class PDFProcessor:
+    def __init__(self):
+        self.processor = DonutProcessor.from_pretrained("naver-clova-ix/donut-base")
+        self.model = VisionEncoderDecoderModel.from_pretrained("naver-clova-ix/donut-base")
+        
+    def extract_from_pdf(self, pdf_path: str) -> dict:
+        """Extract structured data from PDF."""
+        # Convert PDF pages to images
+        images = pdf2image.convert_from_path(pdf_path)
+        
+        results = []
+        for page_num, image in enumerate(images):
+            # Process with Donut
+            pixel_values = self.processor(image, return_tensors="pt").pixel_values
+            outputs = self.model.generate(
+                pixel_values,
+                max_length=512,
+                early_stopping=True,
+                pad_token_id=self.processor.tokenizer.pad_token_id,
+                eos_token_id=self.processor.tokenizer.eos_token_id,
+            )
+            
+            # Decode results
+            sequence = self.processor.batch_decode(outputs)[0]
+            sequence = sequence.replace(self.processor.tokenizer.eos_token, "").replace(
+                self.processor.tokenizer.pad_token, ""
+            )
+            
+            results.append({
+                "page": page_num + 1,
+                "content": sequence,
+                "image": image
+            })
+            
+        return {
+            "total_pages": len(images),
+            "pages": results
+        }
+```
+
+#### Audio Processing
+
+**Technology:** Whisper.cpp
+
+**Implementation:**
+
+```python
+import subprocess
+import json
+from pathlib import Path
+
+class AudioProcessor:
+    def __init__(self, model_path: str = "./models/ggml-tiny.bin"):
+        self.model_path = model_path
+        self.whisper_cpp_path = "./whisper.cpp/main"
+        
+    def transcribe(self, audio_path: str) -> dict:
+        """Transcribe audio to text using Whisper.cpp."""
+        # Convert to WAV if needed
+        wav_path = self._convert_to_wav(audio_path)
+        
+        # Run whisper.cpp
+        cmd = [
+            self.whisper_cpp_path,
+            "-m", self.model_path,
+            "-f", wav_path,
+            "-oj",  # Output JSON
+            "-t", "4",  # 4 threads
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # Parse JSON output
+        output = json.loads(result.stdout)
+        
+        return {
+            "text": output["transcription"],
+            "segments": output["segments"],
+            "language": output["language"],
+            "duration": output["duration"]
+        }
+    
+    def _convert_to_wav(self, audio_path: str) -> str:
+        """Convert audio to WAV format using ffmpeg."""
+        wav_path = audio_path.replace(Path(audio_path).suffix, ".wav")
+        subprocess.run([
+            "ffmpeg", "-i", audio_path,
+            "-ar", "16000",  # 16kHz sample rate
+            "-ac", "1",  # Mono
+            "-c:a", "pcm_s16le",  # 16-bit PCM
+            wav_path
+        ], check=True)
+        return wav_path
+```
+
+#### Image Processing
+
+**Technology:** Qwen-VL
+
+**Implementation:**
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from PIL import Image
+
+class ImageProcessor:
+    def __init__(self):
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "Qwen/Qwen-VL-Chat",
+            trust_remote_code=True
+        )
+        self.model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen-VL-Chat",
+            device_map="auto",
+            trust_remote_code=True
+        ).eval()
+        
+    def analyze_image(self, image_path: str, query: str = "Describe this image in detail") -> dict:
+        """Analyze image and extract information."""
+        # Prepare input
+        query_text = self.tokenizer.from_list_format([
+            {'image': image_path},
+            {'text': query},
+        ])
+        
+        # Generate response
+        response, history = self.model.chat(
+            self.tokenizer,
+            query=query_text,
+            history=None
+        )
+        
+        return {
+            "description": response,
+            "image_path": image_path
+        }
+    
+    def extract_entities(self, image_path: str) -> dict:
+        """Extract business entities from image (charts, tables, text)."""
+        query = """Extract all text, numbers, and structured data from this image. 
+        Identify any charts, tables, or diagrams and describe their content."""
+        
+        return self.analyze_image(image_path, query)
+```
+
+### 2. Privacy Layer Implementation
+
+#### PII/PHI Redaction Engine
+
+**Technology:** spaCy NER + Custom Patterns
+
+**Implementation:**
+
+```python
+import spacy
+import re
+from typing import List, Tuple
+from PIL import Image, ImageDraw
+
+class RedactionEngine:
+    def __init__(self):
+        # Load spaCy model with NER
+        self.nlp = spacy.load("en_core_web_lg")
+        
+        # Define PII patterns
+        self.patterns = {
+            "SSN": r'\b\d{3}-\d{2}-\d{4}\b',
+            "PHONE": r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b',
+            "EMAIL": r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+            "CREDIT_CARD": r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b',
+            "DATE_OF_BIRTH": r'\b\d{1,2}/\d{1,2}/\d{4}\b',
+            "MRN": r'\bMRN[:\s]?\d{6,10}\b'  # Medical Record Number
+        }
+        
+    def redact_text(self, text: str) -> Tuple[str, List[dict]]:
+        """Redact PII/PHI from text."""
+        redacted_text = text
+        redactions = []
+        
+        # Named Entity Recognition
+        doc = self.nlp(text)
+        for ent in doc.ents:
+            if ent.label_ in ["PERSON", "GPE", "ORG", "DATE"]:
+                redacted_text = redacted_text.replace(ent.text, "[REDACTED]")
+                redactions.append({
+                    "type": ent.label_,
+                    "original": ent.text,
+                    "start": ent.start_char,
+                    "end": ent.end_char
+                })
+        
+        # Pattern-based redaction
+        for pii_type, pattern in self.patterns.items():
+            matches = re.finditer(pattern, redacted_text)
+            for match in matches:
+                redacted_text = redacted_text.replace(match.group(), f"[{pii_type}_REDACTED]")
+                redactions.append({
+                    "type": pii_type,
+                    "start": match.start(),
+                    "end": match.end()
+                })
+        
+        return redacted_text, redactions
+    
+    def redact_image(self, image_path: str, bounding_boxes: List[Tuple[int, int, int, int]]) -> str:
+        """Redact sensitive regions in image by blurring."""
+        from PIL import ImageFilter
+        
+        image = Image.open(image_path)
+        
+        for bbox in bounding_boxes:
+            x1, y1, x2, y2 = bbox
+            # Extract region
+            region = image.crop((x1, y1, x2, y2))
+            # Apply blur
+            blurred = region.filter(ImageFilter.GaussianBlur(radius=20))
+            # Paste back
+            image.paste(blurred, (x1, y1))
+        
+        # Save redacted image
+        redacted_path = image_path.replace(".", "_redacted.")
+        image.save(redacted_path)
+        
+        return redacted_path
+    
+    def detect_faces_for_redaction(self, image_path: str) -> List[Tuple[int, int, int, int]]:
+        """Detect faces in image for redaction."""
+        import cv2
+        
+        # Load face detection model
+        face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
+        
+        # Read image
+        image = cv2.imread(image_path)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Detect faces
+        faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+        
+        # Convert to bounding boxes
+        bboxes = [(x, y, x+w, y+h) for (x, y, w, h) in faces]
+        
+        return bboxes
+```
+
+### 3. Reasoning Engine with LangGraph
+
+**Technology:** LangGraph + Llama.cpp
+
+**Implementation:**
+
+```python
+from langgraph.graph import Graph, StateGraph
+from typing import TypedDict, Annotated, Sequence
+import operator
+from langchain_community.llms import LlamaCpp
+
+class AgentState(TypedDict):
+    """State of the reasoning agent."""
+    documents: Sequence[dict]
+    knowledge_graph: dict
+    hypotheses: Sequence[str]
+    validated_hypotheses: Sequence[str]
+    insights: Sequence[str]
+    clarifying_questions: Sequence[str]
+    outputs: dict
+
+class ReasoningEngine:
+    def __init__(self, model_path: str = "./models/llama-3.2-3b.gguf"):
+        self.llm = LlamaCpp(
+            model_path=model_path,
+            n_ctx=4096,
+            n_threads=8,
+            temperature=0.7
+        )
+        
+        # Build reasoning graph
+        self.workflow = self._build_workflow()
+        
+    def _build_workflow(self) -> Graph:
+        """Build LangGraph workflow for multi-step reasoning."""
+        workflow = StateGraph(AgentState)
+        
+        # Add nodes
+        workflow.add_node("parse_documents", self.parse_documents)
+        workflow.add_node("build_knowledge_graph", self.build_knowledge_graph)
+        workflow.add_node("generate_hypotheses", self.generate_hypotheses)
+        workflow.add_node("validate_hypotheses", self.validate_hypotheses)
+        workflow.add_node("generate_insights", self.generate_insights)
+        workflow.add_node("check_completeness", self.check_completeness)
+        
+        # Add edges
+        workflow.set_entry_point("parse_documents")
+        workflow.add_edge("parse_documents", "build_knowledge_graph")
+        workflow.add_edge("build_knowledge_graph", "generate_hypotheses")
+        workflow.add_edge("generate_hypotheses", "validate_hypotheses")
+        workflow.add_edge("validate_hypotheses", "generate_insights")
+        workflow.add_edge("generate_insights", "check_completeness")
+        
+        # Conditional edge for reflection loop
+        workflow.add_conditional_edges(
+            "check_completeness",
+            self.should_continue,
+            {
+                "continue": "generate_hypotheses",  # Loop back
+                "finish": "END"
+            }
+        )
+        
+        return workflow.compile()
+    
+    def parse_documents(self, state: AgentState) -> AgentState:
+        """Parse documents and extract structured information."""
+        parsed_docs = []
+        for doc in state["documents"]:
+            prompt = f"""Extract key entities, metrics, and relationships from:
+            {doc['content']}
+            
+            Format as JSON with: entities, metrics, relationships"""
+            
+            result = self.llm(prompt)
+            parsed_docs.append(result)
+        
+        state["documents"] = parsed_docs
+        return state
+    
+    def build_knowledge_graph(self, state: AgentState) -> AgentState:
+        """Build knowledge graph from parsed documents."""
+        kg = {
+            "entities": [],
+            "relationships": [],
+            "metrics": []
+        }
+        
+        for doc in state["documents"]:
+            # Extract entities and relationships
+            # (Simplified - real implementation would use graph database)
+            prompt = f"""Build a knowledge graph from: {doc}
+            Identify: entities (people, orgs, products), relationships, key metrics"""
+            
+            result = self.llm(prompt)
+            # Parse and add to KG
+            
+        state["knowledge_graph"] = kg
+        return state
+    
+    def generate_hypotheses(self, state: AgentState) -> AgentState:
+        """Generate business hypotheses from knowledge graph."""
+        kg = state["knowledge_graph"]
+        
+        prompt = f"""Based on this business data: {kg}
+        Generate 3-5 testable hypotheses about business performance, 
+        trends, or issues. Be specific and data-driven."""
+        
+        hypotheses = self.llm(prompt)
+        state["hypotheses"] = hypotheses.split("\n")
+        return state
+    
+    def validate_hypotheses(self, state: AgentState) -> AgentState:
+        """Validate hypotheses against available data."""
+        validated = []
+        
+        for hypothesis in state["hypotheses"]:
+            prompt = f"""Hypothesis: {hypothesis}
+            Data: {state['knowledge_graph']}
+            
+            Is this hypothesis supported by the data? Explain."""
+            
+            validation = self.llm(prompt)
+            if "supported" in validation.lower():
+                validated.append(hypothesis)
+        
+        state["validated_hypotheses"] = validated
+        return state
+    
+    def generate_insights(self, state: AgentState) -> AgentState:
+        """Generate actionable insights from validated hypotheses."""
+        insights = []
+        
+        for hypothesis in state["validated_hypotheses"]:
+            prompt = f"""Validated finding: {hypothesis}
+            
+            Generate actionable business insight with:
+            1. What this means
+            2. Why it matters
+            3. Recommended actions"""
+            
+            insight = self.llm(prompt)
+            insights.append(insight)
+        
+        state["insights"] = insights
+        return state
+    
+    def check_completeness(self, state: AgentState) -> AgentState:
+        """Check if analysis is complete or needs more investigation."""
+        prompt = f"""Analysis so far: {state['insights']}
+        
+        Are there gaps or ambiguities that need clarification? 
+        If yes, list specific questions. If no, respond 'COMPLETE'."""
+        
+        result = self.llm(prompt)
+        
+        if "COMPLETE" not in result:
+            state["clarifying_questions"] = result.split("\n")
+        
+        return state
+    
+    def should_continue(self, state: AgentState) -> str:
+        """Decide whether to continue reasoning loop."""
+        if state.get("clarifying_questions"):
+            return "continue"
+        return "finish"
+    
+    def run(self, documents: Sequence[dict]) -> dict:
+        """Execute reasoning workflow."""
+        initial_state = {
+            "documents": documents,
+            "knowledge_graph": {},
+            "hypotheses": [],
+            "validated_hypotheses": [],
+            "insights": [],
+            "clarifying_questions": [],
+            "outputs": {}
+        }
+        
+        final_state = self.workflow.invoke(initial_state)
+        return final_state
+```
+
+### 4. MCP Integration Layer
+
+**Technology:** Custom MCP Client
+
+**Implementation:**
+
+```python
+import httpx
+import json
+from typing import Dict, List, Optional
+from datetime import datetime, timedelta
+
+class MCPClient:
+    def __init__(self, server_url: str = "http://localhost:3000"):
+        self.server_url = server_url
+        self.client = httpx.AsyncClient()
+        self.token_cache = {}
+        
+    async def discover_tools(self) -> List[Dict]:
+        """Discover available tools from MCP server."""
+        response = await self.client.get(f"{self.server_url}/tools")
+        return response.json()["tools"]
+    
+    async def request_token(self, tool_name: str, scope: List[str], duration: int = 3600) -> str:
+        """Request temporary access token for tool."""
+        response = await self.client.post(
+            f"{self.server_url}/tokens",
+            json={
+                "tool": tool_name,
+                "scope": scope,
+                "duration": duration
+            }
+        )
+        
+        token_data = response.json()
+        token = token_data["token"]
+        
+        # Cache token with expiration
+        self.token_cache[tool_name] = {
+            "token": token,
+            "expires_at": datetime.now() + timedelta(seconds=duration)
+        }
+        
+        return token
+    
+    async def invoke_tool(
+        self,
+        tool_name: str,
+        operation: str,
+        parameters: Dict,
+        scope: Optional[List[str]] = None
+    ) -> Dict:
+        """Invoke MCP tool with temporary token."""
+        # Get or request token
+        if tool_name not in self.token_cache or \
+           self.token_cache[tool_name]["expires_at"] < datetime.now():
+            token = await self.request_token(tool_name, scope or ["read"])
+        else:
+            token = self.token_cache[tool_name]["token"]
+        
+        # Invoke tool
+        response = await self.client.post(
+            f"{self.server_url}/tools/{tool_name}/{operation}",
+            json=parameters,
+            headers={"Authorization": f"Bearer {token}"}
+        )
+        
+        return response.json()
+    
+    async def chain_tools(self, chain: List[Dict]) -> List[Dict]:
+        """Execute chain of tool invocations."""
+        results = []
+        context = {}
+        
+        for step in chain:
+            tool_name = step["tool"]
+            operation = step["operation"]
+            parameters = step["parameters"]
+            
+            # Resolve parameter references from previous steps
+            for key, value in parameters.items():
+                if isinstance(value, str) and value.startswith("$"):
+                    # Reference to previous result
+                    ref = value[1:]  # Remove $
+                    parameters[key] = context.get(ref)
+            
+            # Invoke tool
+            result = await self.invoke_tool(
+                tool_name,
+                operation,
+                parameters,
+                step.get("scope")
+            )
+            
+            results.append(result)
+            
+            # Update context for next step
+            if "output_key" in step:
+                context[step["output_key"]] = result
+        
+        return results
+
+# Example usage
+async def healthcare_denial_workflow():
+    """Example: Healthcare claim denial analysis workflow."""
+    mcp = MCPClient()
+    
+    # Discover available tools
+    tools = await mcp.discover_tools()
+    print(f"Available tools: {[t['name'] for t in tools]}")
+    
+    # Define workflow chain
+    chain = [
+        {
+            "tool": "ehr_system",
+            "operation": "get_prior_auth",
+            "parameters": {
+                "patient_id": "P12345",
+                "date_range": "2025-09-01:2025-10-01"
+            },
+            "scope": ["read:prior_auth"],
+            "output_key": "prior_auth"
+        },
+        {
+            "tool": "insurance_portal",
+            "operation": "check_claim_status",
+            "parameters": {
+                "claim_id": "CLM-789456",
+                "prior_auth_ref": "$prior_auth.reference_number"
+            },
+            "scope": ["read:claims"],
+            "output_key": "claim_status"
+        },
+        {
+            "tool": "slack",
+            "operation": "send_message",
+            "parameters": {
+                "channel": "#billing-team",
+                "message": "Claim CLM-789456 can be resubmitted with prior auth $prior_auth.reference_number"
+            },
+            "scope": ["write:messages"]
+        }
+    ]
+    
+    # Execute chain
+    results = await mcp.chain_tools(chain)
+    return results
+```
+
+### 5. Multi-Modal Output Generation
+
+#### Memo Generation
+
+```python
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table
+from reportlab.lib.styles import getSampleStyleSheet
+from datetime import datetime
+
+class MemoGenerator:
+    def __init__(self, llm):
+        self.llm = llm
+        self.styles = getSampleStyleSheet()
+        
+    def generate_memo(self, insights: List[str], sources: List[dict]) -> str:
+        """Generate executive memo from insights."""
+        # Generate content with LLM
+        prompt = f"""Write an executive strategic memo based on these insights:
+        {chr(10).join(insights)}
+        
+        Include:
+        - Subject line
+        - Executive summary (2-3 sentences)
+        - Key findings (3-5 points)
+        - Recommendations (3-5 actions)
+        - Conclusion
+        
+        Professional business tone."""
+        
+        content = self.llm(prompt)
+        
+        # Create PDF
+        filename = f"memo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        doc = SimpleDocTemplate(filename, pagesize=letter)
+        
+        story = []
+        
+        # Add header
+        story.append(Paragraph("CONFIDENTIAL BUSINESS MEMO", self.styles['Title']))
+        story.append(Spacer(1, 12))
+        
+        # Add content
+        for line in content.split("\n"):
+            if line.strip():
+                story.append(Paragraph(line, self.styles['Normal']))
+                story.append(Spacer(1, 6))
+        
+        # Add sources
+        story.append(Spacer(1, 20))
+        story.append(Paragraph("Sources (All PII/PHI Redacted):", self.styles['Heading2']))
+        for source in sources:
+            story.append(Paragraph(
+                f"• {source['name']} (Page {source.get('page', 'N/A')})",
+                self.styles['Normal']
+            ))
+        
+        doc.build(story)
+        
+        return filename
+```
+
+#### Slide Deck Generation
+
+```python
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.enum.text import PP_ALIGN
+
+class SlideGenerator:
+    def __init__(self, llm):
+        self.llm = llm
+        
+    def generate_slides(self, insights: List[str], charts: List[str] = None) -> str:
+        """Generate PowerPoint presentation."""
+        prs = Presentation()
+        prs.slide_width = Inches(10)
+        prs.slide_height = Inches(7.5)
+        
+        # Title slide
+        title_slide_layout = prs.slide_layouts[0]
+        slide = prs.slides.add_slide(title_slide_layout)
+        title = slide.shapes.title
+        subtitle = slide.placeholders[1]
+        
+        title.text = "Strategic Business Analysis"
+        subtitle.text = f"Generated by PrivAgent | {datetime.now().strftime('%B %d, %Y')}"
+        
+        # Generate slide content with LLM
+        prompt = f"""Create 5 slide outlines from these insights:
+        {chr(10).join(insights)}
+        
+        Each slide should have:
+        - Title (max 8 words)
+        - 3-5 bullet points (max 15 words each)
+        
+        Format as:
+        SLIDE 1: [Title]
+        - [Point 1]
+        - [Point 2]
+        ..."""
+        
+        slides_content = self.llm(prompt)
+        
+        # Parse and create slides
+        current_slide = None
+        for line in slides_content.split("\n"):
+            if line.startswith("SLIDE"):
+                # New slide
+                bullet_slide_layout = prs.slide_layouts[1]
+                slide = prs.slides.add_slide(bullet_slide_layout)
+                title = slide.shapes.title
+                title.text = line.split(":")[1].strip()
+                current_slide = slide
+            elif line.strip().startswith("-") and current_slide:
+                # Add bullet point
+                body = current_slide.placeholders[1]
+                tf = body.text_frame
+                p = tf.add_paragraph()
+                p.text = line.strip()[1:].strip()
+                p.level = 0
+        
+        # Add charts if provided
+        if charts:
+            for chart_path in charts:
+                slide = prs.slides.add_slide(prs.slide_layouts[5])  # Blank layout
+                slide.shapes.add_picture(chart_path, Inches(1), Inches(1), width=Inches(8))
+        
+        filename = f"presentation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pptx"
+        prs.save(filename)
+        
+        return filename
+```
+
+---
+
+## Deployment Configuration
+
+### Docker Compose Setup
+
+```yaml
+version: '3.8'
+
+services:
+  frontend:
+    build:
+      context: ./privagent-ui
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=http://backend:8000
+    depends_on:
+      - backend
+    networks:
+      - privagent-network
+
+  backend:
+    build:
+      context: ./privagent_backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_PATH=/models
+      - MCP_SERVER_URL=http://mcp-server:3001
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./models:/models:ro
+      - ./uploads:/tmp/uploads
+    depends_on:
+      - redis
+      - mcp-server
+    networks:
+      - privagent-network
+
+  mcp-server:
+    build:
+      context: ./mcp-server
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - JWT_SECRET=${JWT_SECRET}
+    networks:
+      - privagent-network
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - privagent-network
+
+networks:
+  privagent-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+```
+
+### Kubernetes Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: privagent-backend
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: privagent-backend
+  template:
+    metadata:
+      labels:
+        app: privagent-backend
+    spec:
+      containers:
+      - name: backend
+        image: privagent/backend:latest
+        ports:
+        - containerPort: 8000
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2000m"
+          limits:
+            memory: "8Gi"
+            cpu: "4000m"
+        volumeMounts:
+        - name: models
+          mountPath: /models
+          readOnly: true
+        env:
+        - name: MODEL_PATH
+          value: "/models"
+        - name: MCP_SERVER_URL
+          value: "http://mcp-server:3001"
+      volumes:
+      - name: models
+        persistentVolumeClaim:
+          claimName: models-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: privagent-backend
+spec:
+  selector:
+    app: privagent-backend
+  ports:
+  - protocol: TCP
+    port: 8000
+    targetPort: 8000
+  type: LoadBalancer
+```
+
+---
+
+## Performance Optimization
+
+### Model Quantization
+
+```python
+from optimum.onnxruntime import ORTModelForCausalLM
+from transformers import AutoTokenizer
+
+# Convert and quantize model
+model = ORTModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-3B",
+    export=True,
+    provider="CPUExecutionProvider"
+)
+
+# Apply dynamic quantization
+from onnxruntime.quantization import quantize_dynamic, QuantType
+
+quantize_dynamic(
+    "model.onnx",
+    "model_quantized.onnx",
+    weight_type=QuantType.QInt8
+)
+```
+
+### Caching Strategy
+
+```python
+from functools import lru_cache
+import hashlib
+import redis
+
+class CacheManager:
+    def __init__(self, redis_url: str = "redis://localhost:6379"):
+        self.redis_client = redis.from_url(redis_url)
+        
+    def cache_key(self, data: str) -> str:
+        """Generate cache key from data."""
+        return hashlib.sha256(data.encode()).hexdigest()
+    
+    def get_cached_result(self, key: str) -> Optional[dict]:
+        """Retrieve cached result."""
+        cached = self.redis_client.get(key)
+        if cached:
+            return json.loads(cached)
+        return None
+    
+    def cache_result(self, key: str, result: dict, ttl: int = 3600):
+        """Cache result with TTL."""
+        self.redis_client.setex(
+            key,
+            ttl,
+            json.dumps(result)
+        )
+```
+
+---
+
+## Security Hardening
+
+### API Authentication
+
+```python
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import jwt
+from datetime import datetime, timedelta
+
+security = HTTPBearer()
+
+def create_access_token(data: dict, expires_delta: timedelta = timedelta(hours=1)):
+    """Create JWT access token."""
+    to_encode = data.copy()
+    expire = datetime.utcnow() + expires_delta
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm="HS256")
+    return encoded_jwt
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify JWT token."""
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=["HS256"])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired"
+        )
+    except jwt.JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        )
+```
+
+### Input Validation
+
+```python
+from pydantic import BaseModel, validator, Field
+from typing import List, Optional
+
+class AnalysisRequest(BaseModel):
+    files: List[str] = Field(..., max_items=10)
+    analysis_type: str = Field(..., regex="^(financial|operational|strategic)$")
+    privacy_level: str = Field(default="high", regex="^(low|medium|high)$")
+    
+    @validator('files')
+    def validate_files(cls, v):
+        """Validate file paths."""
+        for file_path in v:
+            if not file_path.endswith(('.pdf', '.jpg', '.png', '.mp3', '.wav', '.txt')):
+                raise ValueError(f"Unsupported file type: {file_path}")
+        return v
+```
+
+---
+
+## Monitoring and Observability
+
+### Logging Configuration
+
+```python
+import logging
+from pythonjsonlogger import jsonlogger
+
+def setup_logging():
+    """Configure structured JSON logging."""
+    logger = logging.getLogger()
+    
+    logHandler = logging.StreamHandler()
+    formatter = jsonlogger.JsonFormatter(
+        '%(timestamp)s %(level)s %(name)s %(message)s'
+    )
+    logHandler.setFormatter(formatter)
+    logger.addHandler(logHandler)
+    logger.setLevel(logging.INFO)
+    
+    return logger
+
+# Usage
+logger = setup_logging()
+logger.info("Processing document", extra={
+    "document_id": "doc123",
+    "file_type": "pdf",
+    "pages": 15
+})
+```
+
+### Metrics Collection
+
+```python
+from prometheus_client import Counter, Histogram, Gauge
+import time
+
+# Define metrics
+request_count = Counter('privagent_requests_total', 'Total requests', ['endpoint', 'status'])
+request_duration = Histogram('privagent_request_duration_seconds', 'Request duration')
+active_analyses = Gauge('privagent_active_analyses', 'Number of active analyses')
+
+# Usage in FastAPI
+@app.post("/analyze")
+async def analyze(request: AnalysisRequest):
+    active_analyses.inc()
+    start_time = time.time()
+    
+    try:
+        result = await process_analysis(request)
+        request_count.labels(endpoint='/analyze', status='success').inc()
+        return result
+    except Exception as e:
+        request_count.labels(endpoint='/analyze', status='error').inc()
+        raise
+    finally:
+        duration = time.time() - start_time
+        request_duration.observe(duration)
+        active_analyses.dec()
+```
+
+---
+
+## Testing Strategy
+
+### Unit Tests
+
+```python
+import pytest
+from privagent.redaction import RedactionEngine
+
+def test_redaction_engine():
+    """Test PII redaction."""
+    engine = RedactionEngine()
+    
+    text = "John Doe's SSN is 123-45-6789 and email is john@example.com"
+    redacted, redactions = engine.redact_text(text)
+    
+    assert "[REDACTED]" in redacted
+    assert "123-45-6789" not in redacted
+    assert "john@example.com" not in redacted
+    assert len(redactions) >= 3  # PERSON, SSN, EMAIL
+
+def test_pdf_processing():
+    """Test PDF extraction."""
+    processor = PDFProcessor()
+    result = processor.extract_from_pdf("test_document.pdf")
+    
+    assert result["total_pages"] > 0
+    assert "content" in result["pages"][0]
+```
+
+### Integration Tests
+
+```python
+import pytest
+from httpx import AsyncClient
+from main import app
+
+@pytest.mark.asyncio
+async def test_full_analysis_workflow():
+    """Test complete analysis workflow."""
+    async with AsyncClient(app=app, base_url="http://test") as client:
+        # Upload files
+        files = {"file": open("test.pdf", "rb")}
+        response = await client.post("/upload", files=files)
+        assert response.status_code == 200
+        
+        # Trigger analysis
+        response = await client.post("/analyze", json={
+            "files": ["test.pdf"],
+            "analysis_type": "financial"
+        })
+        assert response.status_code == 200
+        
+        # Check results
+        result = response.json()
+        assert "insights" in result
+        assert "outputs" in result
+```
+
+---
+
+## Conclusion
+
+This technical implementation guide provides the foundation for building PrivAgent. The modular architecture, comprehensive privacy features, and robust integration capabilities make it suitable for production deployment in sensitive enterprise environments.
+
+For questions or contributions, please refer to the main README or contact the development team.
+

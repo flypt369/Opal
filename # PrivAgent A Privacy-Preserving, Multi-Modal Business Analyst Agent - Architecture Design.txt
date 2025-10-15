@@ -1,0 +1,110 @@
+# Opal: A Privacy-Preserving, Multi-Modal Business Analyst Agent - Architecture Design
+
+## 1. Introduction
+
+This document outlines the architectural design for Opal, an innovative agent designed to autonomously ingest, reason over, and act on multi-modal business data while guaranteeing stringent data privacy. The solution addresses the critical need for businesses to derive actionable insights from complex, unstructured data without compromising sensitive information. Opal integrates state-of-the-art privacy-preserving techniques, multi-modal processing, and dynamic tool orchestration to deliver a secure and intelligent business analysis platform.
+
+## 2. Core Architectural Principles
+
+Opal's architecture is built upon the following core principles to ensure its 
+
+effectiveness, security, and scalability:
+
+*   **Privacy by Design:** All components and data flows are designed with privacy as a foundational requirement, not an afterthought. Sensitive data is processed locally or redacted before any potential exposure.
+*   **Edge-First Processing:** Prioritizing on-device or edge processing for sensitive data to minimize data exfiltration and reduce latency.
+*   **Modularity and Extensibility:** The architecture is composed of loosely coupled modules, allowing for easy updates, replacements, and integration of new tools or models.
+*   **Multi-Modal Capability:** Designed to seamlessly handle and integrate various data types, including text, images, audio, and structured data.
+*   **Dynamic Tool Orchestration:** Utilizing the Model Context Protocol (MCP) for secure, on-demand integration with external systems and APIs.
+*   **Human-like Reasoning:** Incorporating multi-step reasoning, validation, and iterative processes to mimic human analytical capabilities.
+
+## 3. System Components
+
+Opal comprises several key components, each responsible for a specific function within the overall workflow:
+
+### 3.1. User Interface (UI)
+
+*   **Technology:** Streamlit (for rapid prototyping and interactive dashboards).
+*   **Functionality:** Provides an intuitive interface for users to upload multi-modal data (PDFs, images, audio, text), define analysis objectives, and view generated insights and deliverables. It also facilitates user interaction for clarifying questions.
+
+### 3.2. Backend Service
+
+*   **Technology:** FastAPI (for high-performance API endpoints).
+*   **Functionality:** Acts as the central orchestrator, managing the workflow, coordinating between different modules, and exposing APIs for the UI and potentially other internal systems. It handles session management and task queuing.
+
+### 3.3. Multi-Modal Ingestion & Pre-processing Module
+
+*   **Purpose:** To accept diverse input formats and prepare them for analysis.
+*   **Sub-components:**
+    *   **File Ingestor:** Handles uploads of various file types (PDF, JPG, PNG, WAV, MP3, TXT, CSV, XLSX).
+    *   **OCR Engine:** Utilizes tools like `Donut` (Document Understanding Transformer) for extracting text from images and scanned PDFs, and potentially other specialized OCR solutions for complex layouts.
+    *   **Speech-to-Text (STT):** Employs `Whisper.cpp` for efficient, on-device transcription of audio inputs (e.g., meeting transcripts, voice notes).
+    *   **Image/Vision Processor:** Uses `Qwen-VL` or similar Vision-Language Models for understanding visual content, extracting entities, and identifying relevant information from images (e.g., whiteboards, charts).
+
+### 3.4. Privacy Layer
+
+*   **Purpose:** To enforce privacy-by-design principles by redacting or anonymizing sensitive data before further processing.
+*   **Sub-components:**
+    *   **Redaction Engine:** Identifies and redacts PII/PHI across all modalities. For text, this involves NLP-based Named Entity Recognition (NER) and pattern matching. For images/PDFs, it uses computer vision techniques to blur or black out sensitive areas. `PySyft` could be optionally integrated for federated redaction capabilities.
+    *   **On-Device Processing Enforcer:** Ensures that sensitive data processing (e.g., LLM inference) occurs locally using optimized models (`Llama.cpp`, `ONNX Runtime`) to prevent data exfiltration.
+    *   **Zero Data Retention Policy:** Implemented at the system level, ensuring no sensitive data is logged or stored persistently unless explicitly authorized by the user for specific purposes.
+
+### 3.5. Reasoning & Knowledge Graph Module
+
+*   **Technology:** LangGraph (for stateful, cyclic reasoning workflows) combined with local LLMs (`Llama.cpp`).
+*   **Functionality:**
+    *   **Knowledge Graph Construction:** Builds a dynamic knowledge graph from the parsed and structured data, representing business context, relationships, and key performance indicators (KPIs).
+    *   **Multi-Step Reasoning:** Plans, executes, and validates analytical steps. This includes hypothesis generation, data validation, and iterative refinement of insights.
+    *   **Reflection Loop:** Identifies ambiguities or gaps in understanding and generates clarifying questions, which can be posed to the user via the UI or resolved through further internal analysis.
+
+### 3.6. MCP-Powered Tool Orchestration Module
+
+*   **Technology:** Custom lightweight HTTP/gRPC MCP client.
+*   **Functionality:**
+    *   **Tool Discovery:** Dynamically discovers available tools and APIs exposed via MCP servers within the enterprise environment (e.g., CRM, ERP, financial systems).
+    *   **Secure Access:** Requests temporary, scoped access tokens for interacting with discovered tools, ensuring fine-grained authorization and preventing hardcoded credentials.
+    *   **Tool Chaining:** Orchestrates sequences of tool invocations based on the reasoning module's requirements (e.g., `extract_invoice(PDF) → validate_amount(SAP) → notify_slack()`).
+
+### 3.7. Multi-Modal Output Generation Module
+
+*   **Purpose:** To produce actionable and diverse deliverables.
+*   **Sub-components:**
+    *   **Text Generation:** Uses local LLMs (`Llama.cpp`) to generate strategic memos, executive summaries, and detailed reports with citations.
+    *   **Slide Deck Generation:** Combines LLM-generated content with image generation (`Stable Diffusion 3 (tiny)`) for charts and visual elements. Utilizes `python-pptx` for converting Markdown or structured data into presentation slides.
+    *   **Script Generation:** Produces runnable scripts (e.g., Python, SQL) to reproduce analysis or automate tasks.
+    *   **Voice Summary:** Generates concise audio summaries for on-the-go consumption, leveraging text-to-speech capabilities.
+
+## 4. Data Flow and Workflow
+
+1.  **Input:** User uploads multi-modal data via the Streamlit UI.
+2.  **Ingestion & Pre-processing:** The data is ingested, and its components (text, audio, images) are processed by OCR, STT, and Vision Processors.
+3.  **Privacy Enforcement:** The Privacy Layer redacts PII/PHI from all processed data. All subsequent processing of sensitive data occurs on-device.
+4.  **Reasoning & Knowledge Graph:** The cleaned, structured data feeds into the Reasoning Module, which builds a knowledge graph and performs multi-step analysis using local LLMs.
+5.  **Tool Interaction (MCP):** If external data or actions are required, the Reasoning Module interacts with the MCP-Powered Tool Orchestration Module to securely call enterprise APIs.
+6.  **Output Generation:** Based on the analysis, the Multi-Modal Output Generation Module creates various deliverables (memos, slides, scripts, voice summaries).
+7.  **Delivery:** The generated outputs are presented to the user via the Streamlit UI.
+
+## 5. Security and Privacy Mechanisms
+
+*   **On-Prem/Edge Mode:** All sensitive data processing (LLM inference, speech-to-text, OCR) is designed to run locally on the user's machine or within their secure network environment, preventing data from leaving the controlled perimeter.
+*   **Zero Data Retention:** No sensitive input data, intermediate processing results, or generated outputs are persistently stored or logged by the Opal system itself, unless explicitly configured by the user for specific, auditable purposes.
+*   **Redaction Layer:** A proactive redaction engine automatically identifies and blurs/removes PII/PHI from all incoming multi-modal data streams before any analytical processing occurs. This ensures that even local processing operates on de-sensitized information.
+*   **MCP for Secure API Access:** The Model Context Protocol provides a secure and standardized mechanism for the agent to interact with internal enterprise APIs. It facilitates dynamic tool discovery and the request of temporary, scoped access tokens, eliminating the need for hardcoded credentials within the agent's core logic and enabling granular access control.
+*   **Containerization:** The entire application stack (Streamlit, FastAPI, models) is designed for containerization (e.g., Docker), allowing for easy deployment in secure, isolated environments and consistent behavior across different setups.
+*   **Auditable Access:** All interactions with external MCP-enabled tools are logged and auditable through the MCP server, providing transparency and compliance.
+
+## 6. Technology Stack Summary
+
+| Component                       | Technology                                                              | Purpose                                                                   |
+| :------------------------------ | :---------------------------------------------------------------------- | :------------------------------------------------------------------------ |
+| **Agent Framework**             | LangGraph, Llama 3.2 3B (local)                                         | Stateful, cyclic reasoning, core intelligence                             |
+| **Multi-Modal Models**          | Qwen-VL (vision+language), Whisper-tiny (speech), Donut (doc understanding) | Ingestion and understanding of diverse data types                         |
+| **Privacy Enhancements**        | ONNX Runtime, local LLMs, PySyft (optional)                             | On-device processing, data redaction, federated learning capabilities     |
+| **MCP Integration**             | Custom MCP client (HTTP/gRPC)                                           | Dynamic, secure interaction with enterprise APIs                          |
+| **Output Generation**           | Llama 3, Stable Diffusion 3 (tiny), python-pptx                         | Creation of memos, slide decks, scripts, voice summaries                  |
+| **Frontend**                    | Streamlit                                                               | Interactive user interface                                                |
+| **Backend**                     | FastAPI                                                                 | API services, workflow orchestration                                     |
+| **Deployment**                  | Docker (containerization)                                               | Isolated, consistent, and scalable deployment                             |
+
+## 7. Conclusion
+
+Opal's architecture is designed to deliver a powerful, secure, and privacy-aware business analysis solution. By combining advanced AI capabilities with robust privacy mechanisms and dynamic tool integration, it aims to transform how businesses derive insights from their multi-modal data, setting a new standard for intelligent and responsible data processing. This design ensures that the agent can operate effectively in sensitive environments like healthcare and finance, providing a 
