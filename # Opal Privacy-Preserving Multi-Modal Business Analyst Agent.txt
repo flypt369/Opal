@@ -441,7 +441,7 @@ Opal doesn't just provide text answers—it generates comprehensive, actionable 
 
 ```bash
 # Clone repository
-git clone https://github.com/your-org/opal.git
+git clone https://github.com/flypt369/Opal.git
 cd opal
 
 # Install frontend dependencies
@@ -511,8 +511,8 @@ MIT License - See LICENSE file for details
 
 For questions, partnerships, or enterprise inquiries:
 - **Email:** opal@example.com
-- **Website:** https://opal.ai
-- **GitHub:** https://github.com/your-org/opal
+- **Website:** https://opal.ai  
+- **GitHub:** https://github.com/flypt369/Opal
 - **Twitter:** @Opal
 
 ---
